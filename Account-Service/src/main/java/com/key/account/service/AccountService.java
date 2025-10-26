@@ -7,7 +7,9 @@ import com.key.account.enums.AccountType;
 import com.key.account.exception.AccountNotFoundException;
 import com.key.account.repository.AccountRepository;
 import com.key.account.saga.AccountSagaOrchestrator;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
@@ -20,14 +22,20 @@ import java.util.concurrent.CompletableFuture;
 
 @Service
 public class AccountService {
-    @Autowired
-    private AccountRepository accountRepository;
+//    @Autowired
+    private final AccountRepository accountRepository;
 
-    @Autowired
-    private AccountSagaOrchestrator sagaOrchestrator;
+//    @Autowired
+    private final AccountSagaOrchestrator sagaOrchestrator;
 
-    @Autowired
-    private KafkaTemplate<String, Object> kafkaTemplate;
+//    @Autowired
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    public AccountService(AccountRepository accountRepository, AccountSagaOrchestrator sagaOrchestrator, KafkaTemplate<String, Object> kafkaTemplate) {
+        this.accountRepository = accountRepository;
+        this.sagaOrchestrator = sagaOrchestrator;
+        this.kafkaTemplate = kafkaTemplate;
+    }
 
     public Account createAccount(String customerId, AccountType type, BigDecimal initialBalance) {
         Account account = new Account();
@@ -46,7 +54,7 @@ public class AccountService {
     public Account getAccount(String accountId) {
 
         return accountRepository.findByAccountIdAndIsDeletedFalse(accountId)
-                .orElseThrow(() -> new AccountNotFoundException("Account not found"));
+                .orElseThrow(() -> new AccountNotFoundException("Account not found: "+accountId));
     }
 
     // get the balance of the specified account id
@@ -67,6 +75,17 @@ public class AccountService {
         event.put("type", eventType);
         event.put("timestamp", LocalDateTime.now().toString());
         kafkaTemplate.send("account-updated", accountId, event);
+    }
+    @KafkaListener(topics = "deposit-rollback", groupId = "account-group")
+    public void onDepositRollback(ConsumerRecord<String, Object> record) {
+        Map<String, Object> event = (Map<String, Object>) record.value();
+        String accountId = (String) event.get("accountId");
+        BigDecimal amount = new BigDecimal(event.get("amount").toString());
+
+        accountRepository.findByAccountIdAndIsDeletedFalse(accountId).ifPresent(account -> {
+            account.setBalance(account.getBalance().add(amount)); // reverse
+            accountRepository.save(account);
+        });
     }
 
 }

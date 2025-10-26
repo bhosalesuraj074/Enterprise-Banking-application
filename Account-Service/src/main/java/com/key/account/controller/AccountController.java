@@ -2,6 +2,7 @@ package com.key.account.controller;
 
 import com.key.account.dto.AccountRequest;
 import com.key.account.dto.AccountResponse;
+import com.key.account.dto.BalanceUpdateRequest;
 import com.key.account.entity.Account;
 import com.key.account.service.AccountService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -10,6 +11,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.util.concurrent.CompletableFuture;
 
 @RestController
 @RequestMapping("/accounts")
@@ -39,5 +41,12 @@ public class AccountController {
     @GetMapping("/{id}/balance")
     public ResponseEntity<BigDecimal> getBalance(@PathVariable String id) {
         return ResponseEntity.ok(accountService.getBalance(id));
+    }
+
+    @PutMapping("/{id}/balance")
+    public CompletableFuture<ResponseEntity<String>> updateBalance(@PathVariable String id, @RequestBody BalanceUpdateRequest request) {
+        return accountService.updateBalanceAsync(id, request)
+                .thenApply(balance -> ResponseEntity.ok("Updated balance via Saga: " + balance))
+                .exceptionally(ex -> ResponseEntity.badRequest().body("Saga failed: " + ex.getMessage()));
     }
 }
