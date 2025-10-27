@@ -20,43 +20,92 @@ import java.util.Map;
 public class DepositEventListener {
 
     private static final Logger log = LoggerFactory.getLogger(DepositEventListener.class);
+    private final DepositAccountRepository repo;
 
-    @Autowired
-    private DepositAccountRepository repo;
+    public DepositEventListener(DepositAccountRepository repo) {
+        this.repo = repo;
+    }
 
+    /**
+     * Listens to the **account-updated** topic.
+     * Payload format (sent by Account Service):
+     * {
+     *   "accountId": "KEY123ABC",
+     *   "type": "CREATED|UPDATED|CLOSED",   // we care about CREATED & UPDATED
+     *   "balance": "1500.00",
+     *   "currency": "INR"
+     * }
+     */
     @KafkaListener(topics = "account-updated", groupId = "deposit-group")
-    public void onAccountCreated(ConsumerRecord<String, Object> record) {
+    public void onAccountEvent(ConsumerRecord<String, Object> record) {
         @SuppressWarnings("unchecked")
-        Map<String, Object> event = (Map<String, Object>) record.value();
-        if ("CREATED".equals(event.get("type"))) {
-            String accountId = (String) event.get("accountId");
-            BigDecimal balance = new BigDecimal(event.getOrDefault("balance", "0").toString());
+        Map<String, Object> payload = (Map<String, Object>) record.value();
 
-            if (repo.findByAccountIdAndIsDeletedFalse(accountId).isEmpty()) {
-                DepositAccount acc = new DepositAccount();
-                acc.setAccountId(accountId);
-                acc.setBalance(balance);
-                acc.setAvailableBalance(balance);
-                acc.setType(DepositType.CHECKING);
-                acc.setStatus(DepositStatus.ACTIVE);
-                repo.save(acc);
-                log.info("DepositAccount created for: {}", accountId);
-            }
+        String accountId = (String) payload.get("accountId");
+        String type      = (String) payload.get("type");
+        String balanceStr= (String) payload.getOrDefault("balance", "0");
+
+        if (accountId == null || type == null) {
+            log.warn("Invalid account-updated payload – missing fields: {}", payload);
+            return;
+        }
+
+        // -------------------------------------------------
+        // 1. Parse balance safely
+        // -------------------------------------------------
+        BigDecimal balance;
+        try {
+            balance = new BigDecimal(balanceStr);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid balance value '{}' for account {} – skipping", balanceStr, accountId);
+            return;
+        }
+
+        // -------------------------------------------------
+        // 2. Decide what to do
+        // -------------------------------------------------
+        switch (type) {
+            case "CREATED", "UPDATED" -> syncDepositAccount(accountId, balance);
+            case "CLOSED"            -> markDeleted(accountId);
+            default                  -> log.debug("Ignoring event type {} for account {}", type, accountId);
         }
     }
 
-    @KafkaListener(topics = "deposit-rollback", groupId = "deposit-group")
-    public void onRollback(ConsumerRecord<String, Object> record) {
-        @SuppressWarnings("unchecked")
-        Map<String, Object> event = (Map<String, Object>) record.value();
-        String accountId = (String) event.get("accountId");
-        BigDecimal amount = new BigDecimal(event.get("amount").toString()).negate();
+    /** -------------------------------------------------
+     *  CREATE or UPDATE the local DepositAccount
+     *  ------------------------------------------------- */
+    private void syncDepositAccount(String accountId, BigDecimal balance) {
+        repo.findByAccountIdAndIsDeletedFalse(accountId)
+                .ifPresentOrElse(
+                        existing -> {
+                            // ---- UPDATE ----
+                            existing.setBalance(balance);
+                            existing.setAvailableBalance(balance);
+                            repo.save(existing);
+                            log.info("DepositAccount {} balance UPDATED to {}", accountId, balance);
+                        },
+                        () -> {
+                            // ---- CREATE ----
+                            DepositAccount acc = new DepositAccount();
+                            acc.setAccountId(accountId);
+                            acc.setBalance(balance);
+                            acc.setAvailableBalance(balance);
+                            acc.setType(DepositType.CHECKING);
+                            acc.setStatus(DepositStatus.ACTIVE);
+                            repo.save(acc);
+                            log.info("DepositAccount {} CREATED with balance {}", accountId, balance);
+                        });
+    }
 
-        repo.findByAccountIdAndIsDeletedFalse(accountId).ifPresent(acc -> {
-            acc.setBalance(acc.getBalance().add(amount));
-            acc.setAvailableBalance(acc.getAvailableBalance().add(amount));
-            repo.save(acc);
-            log.info("Rollback +{} applied to {}", amount, accountId);
-        });
+    /** -------------------------------------------------
+     *  Soft-delete when Account Service says CLOSED
+     *  ------------------------------------------------- */
+    private void markDeleted(String accountId) {
+        repo.findByAccountIdAndIsDeletedFalse(accountId)
+                .ifPresent(acc -> {
+                    acc.setDeleted(true);
+                    repo.save(acc);
+                    log.info("DepositAccount {} marked DELETED (account closed)", accountId);
+                });
     }
 }

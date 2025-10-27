@@ -65,17 +65,23 @@ public class AccountService {
     // Delegates to Saga for balance updates
     public CompletableFuture<BigDecimal> updateBalanceAsync(String accountId, BalanceUpdateRequest eventUpdate) {
         String updateId = "UPD" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        return sagaOrchestrator.orchestrateBalanceUpdateAsync(updateId, accountId, eventUpdate.getAmount());
+
+        return sagaOrchestrator.orchestrateBalanceUpdateAsync(updateId, accountId, eventUpdate.getAmount())
+                .thenApply(newBalance ->{
+                   publishAccountEvent(accountId, "UPDATED", newBalance);
+                   return newBalance;
+                });
     }
 
     private void publishAccountEvent(String accountId, String eventType, BigDecimal balance) {
         Map<String, Object> event = new HashMap<>();
         event.put("accountId", accountId);
-        event.put("balance", balance);
         event.put("type", eventType);
+        event.put("balance", balance.toPlainString()); // ← CRITICAL: String!
         event.put("timestamp", LocalDateTime.now().toString());
         kafkaTemplate.send("account-updated", accountId, event);
     }
+
     @KafkaListener(topics = "deposit-rollback", groupId = "account-group")
     public void onDepositRollback(ConsumerRecord<String, Object> record) {
         Map<String, Object> event = (Map<String, Object>) record.value();
