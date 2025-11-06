@@ -11,10 +11,10 @@ import com.key.deposite.exception.AccountNotFoundException;
 import com.key.deposite.exception.InvalidAccountBalanceException;
 import com.key.deposite.repository.DepositAccountRepository;
 import com.key.deposite.repository.DepositTransactionRepository;
-import jakarta.transaction.Transactional;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -22,7 +22,12 @@ import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 @Service
 public class DepositService {
@@ -42,55 +47,73 @@ public class DepositService {
     @Transactional
     public CompletableFuture<BigDecimal> creditDepositAsync(String accountId, DepositRequest request) {
         return CompletableFuture.supplyAsync(() -> {
-            try {
-                // Sync Feign call – returns plain BigDecimal
-                BigDecimal currentBalance = accountClient.getBalance(accountId);
-                System.out.println("Account balance fetched: " + currentBalance);
-                return currentBalance;
-            } catch (feign.FeignException.NotFound ex) {
-                System.out.println("Account not found, treating as new: " + accountId);
-                return BigDecimal.ZERO;
-            } catch (Exception ex) {
-                throw new RuntimeException("Account validation failed: " + ex.getMessage(), ex);
-            }
-        }).thenCompose(currentBalance -> {
-            // --- REST OF YOUR LOGIC (unchanged) ---
-            if (currentBalance.compareTo(BigDecimal.ZERO) < 0) {
-                throw new InvalidAccountBalanceException("Invalid account balance");
-            }
+                    try {
+                        BigDecimal currentBalance = accountClient.getBalance(accountId);
+                        System.out.println("Account balance fetched: " + currentBalance);
+                        return currentBalance;
+                    } catch (feign.FeignException.NotFound ex) {
+                        System.out.println("Account not found, treating as new: " + accountId);
+                        return BigDecimal.ZERO;
+                    } catch (Exception ex) {
+                        throw new RuntimeException("Account validation failed: " + ex.getMessage(), ex);
+                    }
+                }).orTimeout(60, TimeUnit.SECONDS)  // Timeout after 60s
+                .thenCompose(currentBalance -> {
+                    if (currentBalance.compareTo(BigDecimal.ZERO) < 0) {
+                        throw new InvalidAccountBalanceException("Invalid account balance");
+                    }
 
-            DepositAccount depositAccount = accountRepository.findByAccountIdAndIsDeletedFalse(accountId)
-                    .orElseGet(() -> createDepositAccount(accountId));
+                    DepositAccount depositAccount = accountRepository.findByAccountIdAndIsDeletedFalse(accountId)
+                            .orElseGet(() -> createDepositAccount(accountId));
 
-            BigDecimal preciseAmount = request.getAmount().setScale(2, RoundingMode.HALF_UP);
-            BigDecimal newBalance = depositAccount.getBalance().add(preciseAmount);
-            depositAccount.setBalance(newBalance);
-            depositAccount.setAvailableBalance(depositAccount.getAvailableBalance().add(preciseAmount));
-            accountRepository.save(depositAccount);
+                    BigDecimal preciseAmount = request.getAmount().setScale(2, RoundingMode.HALF_UP);
+                    BigDecimal newBalance = depositAccount.getBalance().add(preciseAmount);
+                    depositAccount.setBalance(newBalance);
+                    depositAccount.setAvailableBalance(depositAccount.getAvailableBalance().add(preciseAmount));
+                    accountRepository.save(depositAccount);
 
-            DepositTransaction transaction = new DepositTransaction();
-            transaction.setAccountId(accountId);
-            transaction.setAmount(preciseAmount);
-            transaction.setType(TransactionType.CREDIT);
-            transaction.setDescription(request.getDescription());
-            transaction.setReferenceId(request.getReferenceId());
-            transaction.setStatus("POSTED");
-            transaction.setAccount(depositAccount);
-            transactionRepository.save(transaction);
+                    DepositTransaction transaction = new DepositTransaction();
+                    transaction.setAccountId(accountId);
+                    transaction.setAmount(preciseAmount);
+                    transaction.setType(TransactionType.CREDIT);
+                    transaction.setDescription(request.getDescription());
+                    transaction.setReferenceId(request.getReferenceId());
+                    transaction.setStatus("POSTED");
+                    transaction.setAccount(depositAccount);
+                    transactionRepository.save(transaction);
 
-            Map<String, Object> event = new HashMap<>();
-            event.put("accountId", accountId);
-            event.put("amount", preciseAmount.toString());
-            event.put("type", "CREDITED");
-            event.put("currency", "INR");
-            event.put("timestamp", LocalDateTime.now().toString());
-            kafkaTemplate.send("deposit-credited", accountId, event);
+                    Map<String, Object> event = new HashMap<>();
+                    event.put("accountId", accountId);
+                    event.put("amount", preciseAmount.toString());
+                    event.put("type", "CREDITED");
+                    event.put("currency", "INR");
+                    event.put("timestamp", LocalDateTime.now().toString());
+                    kafkaTemplate.send("deposit-credited", accountId, event);
+                    System.out.println("Event published to deposit-credited for " + accountId);
 
-            return CompletableFuture.completedFuture(newBalance);
-        });
+                    return CompletableFuture.completedFuture(newBalance);
+                }).exceptionally(ex -> {
+                    if (ex.getCause() instanceof TimeoutException) {
+                        // Timeout → Trigger rollback
+                        publishRollback(accountId, request.getAmount(), request.getReferenceId());
+                        return BigDecimal.ZERO;  // Fallback
+                    }
+                    throw new RuntimeException("Credit failed: " + ex.getMessage(), ex);
+                });
     }
 
-    
+    private void publishRollback(String accountId, BigDecimal amount, String referenceId) {
+        Map<String, Object> rollbackEvent = new HashMap<>();
+        rollbackEvent.put("accountId", accountId);
+        rollbackEvent.put("amount", amount.toString());
+        rollbackEvent.put("type", "ROLLBACK_CREDIT");
+        rollbackEvent.put("referenceId", referenceId);
+        rollbackEvent.put("timestamp", LocalDateTime.now().toString());
+        rollbackEvent.put("ttl", 86400L);  // 24hr in seconds
+        kafkaTemplate.send("deposit-rollback", accountId, rollbackEvent);
+        System.out.println("Rollback event published for " + accountId);
+    }
+
     private DepositAccount createDepositAccount(String accountId) {
         DepositAccount depositAccount = new DepositAccount();
         depositAccount.setAccountId(accountId);
@@ -102,27 +125,31 @@ public class DepositService {
 
     public List<TransactionHistoryResponse> getTransactionHistory(String accountId, int limit) {
         System.out.println("Fetching history for " + accountId + ", limit: " + limit);
-        return transactionRepository.findRecentByAccountId(accountId).stream()
+        List<DepositTransaction> transactionHistory = transactionRepository.findRecentByAccountId(accountId);
+        System.out.println("Raw transactions found: " + transactionHistory.size());
+
+        List<TransactionHistoryResponse> list = transactionHistory.stream()
                 .limit(limit)
-                .map(tx -> {
-                    TransactionHistoryResponse res = new TransactionHistoryResponse();
-                    res.setId(tx.getId().toString());
-                    res.setAmount(tx.getAmount());
-                    res.setType(tx.getType().toString());
-                    res.setDescription(tx.getDescription());
-                    res.setPostedAt(tx.getPostedAt());
-                    return res;
+                .map(transaction -> {
+                    TransactionHistoryResponse transactionResponse = new TransactionHistoryResponse();
+                    transactionResponse.setId(transaction.getId().toString());
+                    transactionResponse.setAmount(transaction.getAmount());
+                    transactionResponse.setType(transaction.getType().toString());
+                    transactionResponse.setDescription(transaction.getDescription());
+                    transactionResponse.setPostedAt(transaction.getPostedAt());
+                    return transactionResponse;
                 })
-                .toList();
+                .collect(Collectors.toList());
+        System.out.println("Mapped responses: " + list.size());
+        return list;
     }
-    //Retrieves available balance (subtracts holds)
+
     public BigDecimal getAvailableBalance(String accountId) {
         DepositAccount depositAccount = accountRepository.findByAccountIdAndIsDeletedFalse(accountId)
                 .orElseThrow(() -> new AccountNotFoundException("Account not found: " + accountId));
-        return  depositAccount.getAvailableBalance();
+        return depositAccount.getAvailableBalance();
     }
 
-    // Async debits deposit
     @Async
     @Transactional
     public void debitDepositAsync(String accountId, BigDecimal amount) {
@@ -138,7 +165,6 @@ public class DepositService {
         depositAccount.setAvailableBalance(depositAccount.getAvailableBalance().subtract(preciseAmount));
         accountRepository.save(depositAccount);
 
-        // Transaction
         DepositTransaction transaction = new DepositTransaction();
         transaction.setAccountId(accountId);
         transaction.setAmount(preciseAmount.negate());

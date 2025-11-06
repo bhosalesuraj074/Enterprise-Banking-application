@@ -5,11 +5,9 @@ import com.key.deposite.entity.DepositAccount;
 import com.key.deposite.enums.DepositStatus;
 import com.key.deposite.enums.DepositType;
 import com.key.deposite.repository.DepositAccountRepository;
-import com.key.deposite.services.DepositService;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
@@ -29,8 +27,8 @@ public class DepositEventListener {
     /**
      * Listens to the **account-updated** topic.
      * Payload format (sent by Account Service):
-     * {
-     *   "accountId": "KEY123ABC",
+     * ->
+     *   { "accountId": "KEY123ABC",
      *   "type": "CREATED|UPDATED|CLOSED",   // we care about CREATED & UPDATED
      *   "balance": "1500.00",
      *   "currency": "INR"
@@ -97,9 +95,9 @@ public class DepositEventListener {
                         });
     }
 
-    /** -------------------------------------------------
-     *  Soft-delete when Account Service says CLOSED
-     *  ------------------------------------------------- */
+    /** ---------------------
+      Soft-delete when Account Service says CLOSED
+    ----------------------- */
     private void markDeleted(String accountId) {
         repo.findByAccountIdAndIsDeletedFalse(accountId)
                 .ifPresent(acc -> {

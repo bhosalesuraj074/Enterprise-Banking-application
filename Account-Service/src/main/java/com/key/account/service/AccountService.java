@@ -11,6 +11,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -79,7 +80,15 @@ public class AccountService {
         event.put("type", eventType);
         event.put("balance", balance.toPlainString()); // ← CRITICAL: String!
         event.put("timestamp", LocalDateTime.now().toString());
-        kafkaTemplate.send("account-updated", accountId, event);
+        CompletableFuture<SendResult<String, Object>> send = kafkaTemplate.send("account-updated", accountId, event);
+       send.thenAccept(result -> {
+           System.out.println("Message sent successfully to Kafka: " + result.getRecordMetadata().offset());
+       });
+        send.exceptionally(ex -> {
+            System.err.println("Failed to send message to Kafka: " + ex.getMessage());
+            // Perform failure handling here (e.g., retry, alert, etc.)
+            return null;
+        });
     }
 
     @KafkaListener(topics = "deposit-rollback", groupId = "account-group")
